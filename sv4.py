@@ -3,10 +3,11 @@ import re
 import aiohttp
 from aiohttp import web
 import asyncio
+import logging
 from typing import List
 from datetime import timedelta
 from pyrogram import Client, filters
-from pyrogram.enums import ParseMode
+from pyrogram.enums import ParseMode, ChatMemberStatus
 from pyrogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
@@ -14,11 +15,14 @@ from pyrogram.types import (
     CallbackQuery,
     Message
 )
+from pyrogram.errors import BadRequest
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from datetime import datetime
 from urllib.parse import unquote
 
+
+# Import feature modules
 from features.stats import register_stats_command
 from features.broadcast import register_broadcast_command
 from features.reindex import register_reindex_command
@@ -27,6 +31,16 @@ from features.inactive import register_inactive_command
 from features.tagstats import register_tagstats_command
 from features.fileinfo import register_fileinfo_command
 from features.fileids import register_fileids_command
+
+from notify import send_notification
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -42,10 +56,22 @@ CONFIG = {
     'DB_NAME': os.getenv('DB_NAME', 'telegramstore')
 }
 
+# Force Join Configuration
+CHANNEL_USERNAMES = [name.strip() for name in os.getenv("CHANNEL_USERNAMES", "@megahubbots").split(",")]
+CHANNEL_LINKS = [link.strip() for link in os.getenv("CHANNEL_LINKS", "https://t.me/megahubbots").split(",")]
+
+# Ensure all channel usernames start with @
+CHANNEL_USERNAMES = [name if name.startswith("@") else f"@{name}" for name in CHANNEL_USERNAMES]
+
+if len(CHANNEL_USERNAMES) != len(CHANNEL_LINKS):
+    logger.error("CHANNEL_USERNAMES and CHANNEL_LINKS must have the same number of elements")
+    raise ValueError("Channel configuration mismatch")
+
 # Initialize MongoDB
 mongo_client = MongoClient(CONFIG['MONGO_URI'])
 db = mongo_client[CONFIG['DB_NAME']]
 files_collection = db['channel_files']
+users_collection = db['users']
 
 # Initialize bot
 bot = Client(
@@ -71,9 +97,80 @@ def main_menu():
         ]
     ])
 
+async def is_user_member(client: Client, user_id: int) -> bool:
+    """Check if user is member of all required channels."""
+    for channel in CHANNEL_USERNAMES:
+        try:
+            channel = channel.strip()
+            if not channel.startswith("@"): channel = f"@{channel}"
+            member = await client.get_chat_member(channel, user_id)
+            # Use enum for status comparison
+            if member.status not in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+                logger.info(f"User {user_id} not member of {channel} (status: {member.status})")
+                return False
+        except BadRequest as e:
+            logger.error(f"Error checking membership for {channel}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error checking membership: {e}")
+            return False
+    return True
+
+async def prompt_force_join(message: Message):
+    """Send force join message with buttons for all channels."""
+    buttons = []
+    for i, channel in enumerate(CHANNEL_USERNAMES):
+        display_name = channel.lstrip('@')
+        buttons.append([
+            InlineKeyboardButton(f"Join {display_name}", url=CHANNEL_LINKS[i])
+        ])
+    
+    buttons.append([InlineKeyboardButton("✅ I've Joined", callback_data="verify_join")])
+    
+    await message.reply_text(
+        "🔒 *Access Restricted* 🔒\n\n"
+        "To use this bot, you must join our official channels:\n\n"
+        "👉 Tap each button below to join\n"
+        "👉 Then click 'I've Joined' to verify",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=ParseMode.HTML
+    )
+
+@bot.on_callback_query(filters.regex(r"^verify_join$"))
+async def verify_join_callback(client: Client, callback_query: CallbackQuery):
+    """Handle join verification callback"""
+    user_id = callback_query.from_user.id
+    logger.info(f"Verifying join for user {user_id}")
+    
+    is_member = await is_user_member(client, user_id)
+    logger.info(f"Verification result for {user_id}: {is_member}")
+    
+    if is_member:
+        await callback_query.answer("✅ Verification successful! You can now use the bot.")
+        await callback_query.message.edit_text(
+            "✅ *Verification Complete!*\n\n"
+            "You've successfully joined all required channels.\n"
+            "Use /start to begin!",
+            parse_mode=ParseMode.HTML
+        )
+        # Update user status in DB
+        users_collection.update_one(
+            {'user_id': user_id},
+            {'$set': {'verified_member': True}},
+            upsert=True
+        )
+    else:
+        await callback_query.answer("❌ You haven't joined all channels yet!", show_alert=True)
+        # Log which channels are missing
+        for channel in CHANNEL_USERNAMES:
+            try:
+                member = await client.get_chat_member(channel, user_id)
+                logger.info(f"User {user_id} status in {channel}: {member.status}")
+            except Exception as e:
+                logger.error(f"Error checking {channel}: {e}")
 
 def clean_filename(filename):
-    """Clean and format filename for  display"""
+    """Clean and format filename for display"""
     if not filename:
         return "Untitled"
     
@@ -241,7 +338,7 @@ async def send_files_to_user(client, chat_id, files):
             sent_messages.append(msg)
             await asyncio.sleep(1)
         except Exception as e:
-            print(f"Error sending file: {e}")
+            logger.error(f"Error sending file: {e}")
 
     warning_text = (
         "<blockquote>"
@@ -251,7 +348,6 @@ async def send_files_to_user(client, chat_id, files):
         "</blockquote>"
     )
 
-    # Send warning as a quoted reply to the last sent file (Telegram style)
     if sent_messages:
         warning_msg = await sent_messages[-1].reply(
             warning_text,
@@ -266,19 +362,19 @@ async def send_files_to_user(client, chat_id, files):
         )
 
     async def delete_after_delay(messages):
-        await asyncio.sleep(10)  # 10 seconds delay
+        await asyncio.sleep(600)  # 10 minutes delay
         for msg in messages:
             try:
                 await msg.delete()
             except Exception as e:
-                print(f"Error deleting message: {e}")
+                logger.error(f"Error deleting message: {e}")
         try:
             await warning_msg.edit_text(
                 "🗑️ <i>Files have been automatically deleted</i>",
                 parse_mode=ParseMode.HTML
             )
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Error editing warning message: {e}")
 
     asyncio.create_task(delete_after_delay(sent_messages))
 
@@ -288,8 +384,15 @@ async def send_files_to_user(client, chat_id, files):
                         "deletefile", "inactive", "tagstats", "fileinfo", "fileids"])
     & ~filters.chat(CONFIG['SOURCE_CHANNEL'])
 )
-
 async def search_handler(client, message: Message):
+    if not await is_user_member(client, message.from_user.id):
+        await prompt_force_join(message)
+        return
+    
+    # Log the search query
+    await send_notification(client, message.from_user.id, getattr(message.from_user, 'username', None), "Searched for files",)
+    logger.info(f"User {message.from_user.id} searched for files: {message.text.strip()}")
+    
     query = message.text.strip()
     if len(query) < 3:
         await message.reply("Please enter at least 3 characters to search.")
@@ -399,8 +502,14 @@ async def channel_message_handler(client, message: Message):
 
 @bot.on_message(filters.command("start"))
 async def start_handler(client, message: Message):
+    if not await is_user_member(client, message.from_user.id):
+        await prompt_force_join(message)
+        return
+    
+    await send_notification(client, message.from_user.id, getattr(message.from_user, 'username', None), "Started the bot")
+    logger.info(f"User {message.from_user.id} started the bot")
+    
     # Store user info in database
-    users_collection = db['users']
     users_collection.update_one(
         {'user_id': message.from_user.id},
         {'$set': {
@@ -419,6 +528,7 @@ async def start_handler(client, message: Message):
         parse_mode=ParseMode.HTML
     )
 
+# [Rest of your existing handlers...]
 @bot.on_message(filters.command("help"))
 async def help_command(client, message: Message):
     await message.reply(
@@ -632,11 +742,6 @@ def register_all_features():
 WEBHOOK_PATH = f"/{CONFIG['BOT_TOKEN']}"
 PORT = int(os.environ.get("PORT", 10000))
 RENDER_HOST = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-# If running on Render, set the webhook URL
-if RENDER_HOST:
-    WEBHOOK_URL = f"https://{RENDER_HOST}{WEBHOOK_PATH}"
-else:
-    WEBHOOK_URL = None
 
 async def handle_webhook(request):
     data = await request.json()
@@ -644,9 +749,11 @@ async def handle_webhook(request):
     return web.Response(text="OK")
 
 async def main():
-    print("Bot is running...")
+    logger.info("Bot is starting...")
     register_all_features()
-    if WEBHOOK_URL:
+    
+    if RENDER_HOST:
+        WEBHOOK_URL = f"https://{RENDER_HOST}{WEBHOOK_PATH}"
         await bot.start()
         await bot.set_webhook(WEBHOOK_URL)
         app = web.Application()
@@ -655,11 +762,12 @@ async def main():
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", PORT)
         await site.start()
-        print(f"Webhook running on {WEBHOOK_URL}")
+        logger.info(f"Webhook running on {WEBHOOK_URL}")
         while True:
             await asyncio.sleep(3600)
     else:
-        bot.run()
+        logger.info("Running in polling mode...")
+        await bot.run()
 
 if __name__ == '__main__':
     if os.environ.get("RENDER_EXTERNAL_HOSTNAME"):
