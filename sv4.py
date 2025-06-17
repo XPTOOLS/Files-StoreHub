@@ -740,47 +740,51 @@ def register_all_features():
     register_fileids_command(bot, db, CONFIG)
 
 WEBHOOK_PATH = f"/{CONFIG['BOT_TOKEN']}"
-PORT = int(os.environ.get("PORT", 10000))
-RENDER_HOST = os.environ.get("https://files-storehub.onrender.com")
+# Webhook configuration
+PORT = int(os.getenv("PORT", 10000))
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "12345")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://files-storehub.onrender.com") + WEBHOOK_PATH
 
+# Handle Telegram webhook updates
 async def handle_webhook(request):
-    data = await request.json()
-    await bot.process_update(data)
+    try:
+        data = await request.json()
+        await bot.process_update(data)
+    except Exception as e:
+        logger.error(f"Webhook handling failed: {e}")
     return web.Response(text="OK")
 
+# Simple homepage for Render health check
+async def index(request):
+    return web.Response(
+        text="<h2>✅ Telegram Bot is Running</h2><p>This server is for webhook only.</p>",
+        content_type='text/html'
+    )
+
+# Main async entry
 async def main():
     logger.info("Bot is starting...")
     register_all_features()
-    
-    if RENDER_HOST:
-        WEBHOOK_URL = f"https://{RENDER_HOST}{WEBHOOK_PATH}"
-        await bot.start()
-        app = web.Application()
-        app.router.add_post(WEBHOOK_PATH, handle_webhook)
+    await bot.start()
 
-        # Add a simple GET route at root
-        async def index(request):
-            return web.Response(
-    text="<h2>✅ Telegram Bot is Running</h2><p>This server is for webhook only.</p>",
-    content_type='text/html'
-)
+    # Start aiohttp web server for webhook
+    app = web.Application()
+    app.router.add_get("/", index)
+    app.router.add_post(WEBHOOK_PATH, handle_webhook)
 
-        app.router.add_get("/", index)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
 
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", PORT)
-        await site.start()
-        logger.info(f"Webhook running on {WEBHOOK_URL}")
-        while True:
-            await asyncio.sleep(3600)
-    else:
-        logger.info("Running in polling mode...")
-        await bot.run()
+    logger.info(f"Webhook listening at {WEBHOOK_URL}")
 
-if __name__ == '__main__':
-    if os.environ.get("RENDER_EXTERNAL_HOSTNAME"):
-        asyncio.run(main())
-    else:
-        register_all_features()
-        bot.run()
+    # Keep process alive
+    while True:
+        await asyncio.sleep(3600)
+
+# Run the bot
+if __name__ == "__main__":
+    asyncio.run(main())
+
