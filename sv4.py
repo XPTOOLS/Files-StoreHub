@@ -753,10 +753,20 @@ async def main():
     register_all_features()
     
     if RENDER_HOST:
-        WEBHOOK_URL = f"https://files-storehub.onrender.com"
+        WEBHOOK_URL = f"https://{RENDER_HOST}{WEBHOOK_PATH}"
         await bot.start()
         app = web.Application()
         app.router.add_post(WEBHOOK_PATH, handle_webhook)
+
+        # Add a simple GET route at root
+        async def index(request):
+            return web.Response(
+    text="<h2>✅ Telegram Bot is Running</h2><p>This server is for webhook only.</p>",
+    content_type='text/html'
+)
+
+        app.router.add_get("/", index)
+
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", PORT)
