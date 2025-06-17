@@ -741,7 +741,7 @@ def register_all_features():
 
 WEBHOOK_PATH = f"/{CONFIG['BOT_TOKEN']}"
 PORT = int(os.environ.get("PORT", 10000))
-RENDER_HOST = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+RENDER_HOST = os.environ.get("https://files-storehub.onrender.com")
 
 async def handle_webhook(request):
     data = await request.json()
