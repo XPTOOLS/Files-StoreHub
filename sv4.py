@@ -753,7 +753,7 @@ async def main():
     register_all_features()
     
     if RENDER_HOST:
-        WEBHOOK_URL = f"https://{RENDER_HOST}{WEBHOOK_PATH}"
+        WEBHOOK_URL = f"https://files-storehub.onrender.com"
         await bot.start()
         await bot.set_webhook(WEBHOOK_URL)
         app = web.Application()
