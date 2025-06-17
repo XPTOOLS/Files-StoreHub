@@ -21,8 +21,6 @@ from pymongo import MongoClient
 from datetime import datetime
 from urllib.parse import unquote
 
-
-# Import feature modules
 from features.stats import register_stats_command
 from features.broadcast import register_broadcast_command
 from features.reindex import register_reindex_command
@@ -31,9 +29,6 @@ from features.inactive import register_inactive_command
 from features.tagstats import register_tagstats_command
 from features.fileinfo import register_fileinfo_command
 from features.fileids import register_fileids_command
-
-from notify import send_notification
-
 
 # Configure logging
 logging.basicConfig(
@@ -389,10 +384,6 @@ async def search_handler(client, message: Message):
         await prompt_force_join(message)
         return
     
-    # Log the search query
-    await send_notification(client, message.from_user.id, getattr(message.from_user, 'username', None), "Searched for files",)
-    logger.info(f"User {message.from_user.id} searched for files: {message.text.strip()}")
-    
     query = message.text.strip()
     if len(query) < 3:
         await message.reply("Please enter at least 3 characters to search.")
@@ -505,9 +496,6 @@ async def start_handler(client, message: Message):
     if not await is_user_member(client, message.from_user.id):
         await prompt_force_join(message)
         return
-    
-    await send_notification(client, message.from_user.id, getattr(message.from_user, 'username', None), "Started the bot")
-    logger.info(f"User {message.from_user.id} started the bot")
     
     # Store user info in database
     users_collection.update_one(
@@ -740,51 +728,47 @@ def register_all_features():
     register_fileids_command(bot, db, CONFIG)
 
 WEBHOOK_PATH = f"/{CONFIG['BOT_TOKEN']}"
-# Webhook configuration
-PORT = int(os.getenv("PORT", 10000))
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "12345")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://files-storehub.onrender.com") + WEBHOOK_PATH
+PORT = int(os.environ.get("PORT", 10000))
+RENDER_HOST = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 
-# Handle Telegram webhook updates
 async def handle_webhook(request):
-    try:
-        data = await request.json()
-        await bot.process_update(data)
-    except Exception as e:
-        logger.error(f"Webhook handling failed: {e}")
+    data = await request.json()
+    await bot.process_update(data)
     return web.Response(text="OK")
 
-# Simple homepage for Render health check
-async def index(request):
-    return web.Response(
-        text="<h2>✅ Telegram Bot is Running</h2><p>This server is for webhook only.</p>",
-        content_type='text/html'
-    )
-
-# Main async entry
 async def main():
     logger.info("Bot is starting...")
     register_all_features()
-    await bot.start()
+    
+    if RENDER_HOST:
+        WEBHOOK_URL = f"https://{RENDER_HOST}{WEBHOOK_PATH}"
+        await bot.start()
+        app = web.Application()
+        app.router.add_post(WEBHOOK_PATH, handle_webhook)
 
-    # Start aiohttp web server for webhook
-    app = web.Application()
-    app.router.add_get("/", index)
-    app.router.add_post(WEBHOOK_PATH, handle_webhook)
+        # Add a simple GET route at root
+        async def index(request):
+            return web.Response(
+    text="<h2>✅ Telegram Bot is Running</h2><p>This server is for webhook only.</p>",
+    content_type='text/html'
+)
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+        app.router.add_get("/", index)
 
-    logger.info(f"Webhook listening at {WEBHOOK_URL}")
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+        logger.info(f"Webhook running on {WEBHOOK_URL}")
+        while True:
+            await asyncio.sleep(3600)
+    else:
+        logger.info("Running in polling mode...")
+        await bot.run()
 
-    # Keep process alive
-    while True:
-        await asyncio.sleep(3600)
-
-# Run the bot
-if __name__ == "__main__":
-    asyncio.run(main())
-
+if __name__ == '__main__':
+    if os.environ.get("RENDER_EXTERNAL_HOSTNAME"):
+        asyncio.run(main())
+    else:
+        register_all_features()
+        bot.run()
